@@ -12,6 +12,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 import migrator
+from autowriter import AutoWriter
 from db import connect, ensure_meta_tables, log, logs_since
 from migrator import (
     AlreadyDone,
@@ -244,53 +245,33 @@ def api_demo_write(req: WriteReq):
 
 
 # 自动采集写入（演示复制期间持续不断的独立写入）
+#
+# 停止 / 切月的正确性由 AutoWriter 保证：
+#   * 控制请求只改状态立即返回，绝不 join 等待在途写入；
+#   * 在途写入结束、旧线程退出前，不宣告"已停止"、不启动新月份；
+#   * 停止等待中再次取消会撤销待启动月份。
 class AutoReq(BaseModel):
     enabled: bool
-    month: str
+    month: str = ""
     interval_ms: int = Field(default=300, ge=50, le=10000)
 
 
-_auto_stop = threading.Event()
-_auto_thread: threading.Thread | None = None
-_auto_lock = threading.Lock()
-
-
-def _auto_loop(month: str, interval_ms: int):
-    ops = ["insert"] * 5 + ["update"] * 3 + ["delete"] * 2
-    while not _auto_stop.is_set():
-        try:
-            result = demo_write(random.choice(ops), month)
-            log(f"[自动采集] {result}")
-        except Exception as exc:  # noqa: BLE001
-            log(f"[自动采集] 写入失败: {exc!r}")
-        _auto_stop.wait(interval_ms / 1000)
+AUTO_WRITER = AutoWriter(demo_write)
 
 
 def auto_writer_state() -> dict:
-    t = _auto_thread
-    return {"running": bool(t and t.is_alive())}
+    return AUTO_WRITER.state()
 
 
 @app.post("/api/demo/auto")
 def api_demo_auto(req: AutoReq):
-    global _auto_thread
-    with _auto_lock:
-        if _auto_thread and _auto_thread.is_alive():
-            _auto_stop.set()
-            _auto_thread.join(timeout=3)
-        _auto_thread = None
-        if req.enabled:
+    if req.enabled:
+        try:
             parse_month(req.month)
-            _auto_stop.clear()
-            _auto_thread = threading.Thread(
-                target=_auto_loop, args=(req.month, req.interval_ms),
-                daemon=True, name="auto-writer",
-            )
-            _auto_thread.start()
-            log(f"[自动采集] 已启动，目标月份 {req.month}，间隔 {req.interval_ms}ms")
-        else:
-            log("[自动采集] 已停止")
-    return auto_writer_state()
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+    # 立即返回真实状态（idle/running/stopping + 当前月/待启动月），不阻塞
+    return AUTO_WRITER.control(req.enabled, req.month or None, req.interval_ms)
 
 
 # ------------------------------------------------------------- 自测用崩溃注入

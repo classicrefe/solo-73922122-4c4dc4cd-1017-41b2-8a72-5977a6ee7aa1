@@ -96,8 +96,11 @@
     <div class="row">
       <label>自动采集间隔ms</label><input id="wInterval" type="number" value="300" style="width:80px">
       <button id="wAuto" class="ghost">启动自动采集</button>
+      <button id="wCancelPending" class="danger" style="display:none">撤销待启动</button>
       <span id="wState" class="dim">已停止</span>
     </div>
+    <div class="dim" style="font-size:12px">停止/切月不等待在途写入：被数据库锁挡住时状态为"停止中"，
+      旧采集线程退出后才算停止或启动待切换月份。</div>
     <div id="wLast" class="mono dim" style="font-size:12px">—</div>
   </section>
 
@@ -176,10 +179,39 @@ async function refresh() {
   }
   syncSelects(sel);
   updateProgress();
-  document.getElementById('wState').textContent =
-    state.auto_writer.running ? '自动采集运行中' : '已停止';
-  document.getElementById('wAuto').textContent =
-    state.auto_writer.running ? '停止自动采集' : '启动自动采集';
+  renderAuto();
+}
+
+// 自动采集状态展示：当前月 / 待启动月 / 真实阶段（idle/running/stopping）
+function renderAuto() {
+  if (!state || !state.auto_writer) return;
+  const aw = state.auto_writer;
+  const el = document.getElementById('wState');
+  const btn = document.getElementById('wAuto');
+  const cancelBtn = document.getElementById('wCancelPending');
+  const sel = document.getElementById('wMonth').value;
+  if (aw.phase === 'running') {
+    el.innerHTML = `自动采集 <b>运行中</b> · 当前月 <b class="mono">${aw.month}</b>` +
+      ` · 本轮已写 ${aw.writes} 次`;
+    btn.textContent = (sel && sel !== aw.month) ? `停止 ${aw.month} 并切换到 ${sel}` : '停止自动采集';
+    btn.disabled = false;
+  } else if (aw.phase === 'stopping') {
+    el.innerHTML = `自动采集 <b>停止中</b> · 当前月 <b class="mono">${aw.month}</b>` +
+      (aw.in_flight ? '（在途写入未结束，可能被数据库锁挡住）' : '（等待线程退出）') +
+      (aw.pending_month ? ` · 待启动 <b class="mono">${aw.pending_month}</b>` : '');
+    if (sel && sel !== aw.pending_month) {
+      btn.textContent = `待启动改为 ${sel}`;
+      btn.disabled = false;
+    } else {
+      btn.textContent = '停止中…';
+      btn.disabled = true;
+    }
+  } else {
+    el.textContent = '已停止';
+    btn.textContent = '启动自动采集';
+    btn.disabled = false;
+  }
+  cancelBtn.style.display = aw.pending_month ? '' : 'none';
 }
 
 function syncSelects(months) {
@@ -236,11 +268,37 @@ async function doWrite(op) {
 }
 
 async function toggleAuto() {
-  const running = state && state.auto_writer.running;
-  const body = { enabled: !running,
-    month: document.getElementById('wMonth').value,
-    interval_ms: +document.getElementById('wInterval').value };
-  await api('/api/demo/auto', {method:'POST', body: JSON.stringify(body)});
+  const aw = state && state.auto_writer;
+  const sel = document.getElementById('wMonth').value;
+  const interval = +document.getElementById('wInterval').value;
+  let body = null;
+  if (!aw || aw.phase === 'idle') {
+    body = { enabled: true, month: sel, interval_ms: interval };
+  } else if (aw.phase === 'running') {
+    // 选中不同月份 → 切月（旧月停止中、新月登记为待启动）；同月 → 停止
+    body = (sel && sel !== aw.month)
+      ? { enabled: true, month: sel, interval_ms: interval }
+      : { enabled: false };
+  } else if (aw.phase === 'stopping') {
+    // 停止等待中：可改待启动月份（服务端不等待在途写入）
+    if (sel && sel !== aw.pending_month)
+      body = { enabled: true, month: sel, interval_ms: interval };
+  }
+  if (!body) return;
+  try {
+    const r = await api('/api/demo/auto', {method:'POST', body: JSON.stringify(body)});
+    if (state) { state.auto_writer = r; renderAuto(); }
+  } catch (e) { alert('控制失败：' + e.message); }
+  refresh();
+}
+
+// 停止等待中再次取消：撤销待启动月份
+async function cancelPending() {
+  try {
+    const r = await api('/api/demo/auto', {method:'POST',
+      body: JSON.stringify({enabled: false})});
+    if (state) { state.auto_writer = r; renderAuto(); }
+  } catch (e) { alert('控制失败：' + e.message); }
   refresh();
 }
 
@@ -283,6 +341,9 @@ async function pollLog() {
 
 document.getElementById('mStart').onclick = startMigration;
 document.getElementById('wAuto').onclick = toggleAuto;
+document.getElementById('wCancelPending').onclick = cancelPending;
+// 切换目标月份时刷新按钮文案（运行中可切月、停止中可改待启动）
+document.getElementById('wMonth').onchange = renderAuto;
 document.getElementById('qAuto').onchange = e => {
   if (e.target.checked) doQuery();
 };

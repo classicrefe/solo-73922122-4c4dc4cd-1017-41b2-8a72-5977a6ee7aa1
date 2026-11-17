@@ -7,7 +7,11 @@
   3. 已完成月份再次迁移 → 409 且数据不变
   4. copying / finalizing 阶段故障注入 → 父表完整可查 → 重试完成
   5. SIGKILL 应用进程（复制进行中）→ 父表仍完整可查可写 → 重启后重试完成
-  6. 收尾检查：默认分区无残留、无重复主键、触发器/增量清理干净
+  6. 自动采集停止/切月：在途写入被 SHARE 锁挡住时，控制请求立即返回
+     "停止中/待启动"真实状态；锁解除后旧线程退出、待启动月自动接管；
+     停止等待中再次取消可撤销待启动月份
+  7. 自动采集连续控制：快速启停/切月/取消，响应快速且状态自洽，收敛到最后意图
+  8. 收尾检查：默认分区无残留、无重复主键、触发器/增量清理干净
 
 运行：DATABASE_URL=... python3 scripts/selftest.py
 （脚本自己拉起/杀掉 uvicorn 进程；要求 DATABASE_URL 指向已初始化的库）
@@ -178,6 +182,50 @@ class ChaosWriter(threading.Thread):
 
 
 # ------------------------------------------------------------------ app 进程
+def post_auto(body: dict) -> requests.Response:
+    return requests.post(f"{BASE}/api/demo/auto", json=body, timeout=10)
+
+
+def auto_state() -> dict:
+    r = requests.get(f"{BASE}/api/state", timeout=5)
+    r.raise_for_status()
+    return r.json()["auto_writer"]
+
+
+def month_row_count(month: str) -> int:
+    lo, hi = month_range(month)
+    with db() as c:
+        return c.execute(
+            "SELECT count(*) FROM observations WHERE ts >= %s AND ts < %s",
+            (lo, hi),
+        ).fetchone()[0]
+
+
+def wait_auto(want_phase: str, want_month: str | None = None, timeout=20) -> dict:
+    """等待自动采集进入指定阶段（可附带月份），返回最终状态。"""
+    deadline = time.time() + timeout
+    last = {}
+    while time.time() < deadline:
+        last = auto_state()
+        if last["phase"] == want_phase and (
+            want_month is None or last["month"] == want_month
+        ):
+            return last
+        time.sleep(0.2)
+    raise RuntimeError(f"自动采集等待 {want_phase}/{want_month} 超时，当前 {last}")
+
+
+def check_auto_coherent(st: dict) -> bool:
+    """自动采集状态的基本一致性（任何时刻都应满足）。"""
+    if st["phase"] not in ("idle", "running", "stopping"):
+        return False
+    if st["phase"] == "idle":
+        return st["month"] is None and st["pending_month"] is None
+    if st["phase"] == "running":
+        return st["month"] is not None and st["pending_month"] is None
+    return st["month"] is not None  # stopping：旧线程尚未退出
+
+
 _app_proc: subprocess.Popen | None = None
 
 
@@ -282,6 +330,166 @@ def verify_month(month: str, expected: dict, label: str):
 
 
 # ---------------------------------------------------------------------- 用例
+def test_auto_writer_blocked_stop_switch(month_a: str, month_b: str):
+    """核心场景：甲月写入被数据库锁挡住时，停止/切月必须如实报告且不等待。"""
+    print(f"\n== 用例：自动采集停止/切月 —— 在途写入被锁阻塞（{month_a}→{month_b}）==",
+          flush=True)
+    post_auto({"enabled": False})
+    try:
+        wait_auto("idle", timeout=10)
+    except RuntimeError:
+        pass
+    # 1) 启动甲月自动采集，确认真的在写
+    r = post_auto({"enabled": True, "month": month_a, "interval_ms": 100})
+    st = r.json()
+    check("启动甲月自动采集", r.ok and st["phase"] == "running"
+          and st["month"] == month_a, r.text[:200])
+    st = wait_auto("running", month_a, timeout=10)
+    deadline = time.time() + 10
+    while st["writes"] == 0 and time.time() < deadline:
+        time.sleep(0.2)
+        st = auto_state()
+    check("甲月已有写入完成", st["writes"] > 0, f"writes={st['writes']}")
+
+    # 2) 另一事务对父表加 SHARE 锁（与迁移 finalizing 同款），采集写入被挡住
+    lock_conn = psycopg.connect(DSN, options="-c timezone=UTC")
+    try:
+        lock_conn.execute("LOCK TABLE observations IN SHARE MODE")
+        # 3) 等采集连接的在途写入真正被锁挡住（未授予的锁 + 应用侧 in_flight）
+        blocked = False
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            with db() as c:
+                n = c.execute(
+                    "SELECT count(*) FROM pg_locks"
+                    " WHERE relation = 'observations'::regclass AND NOT granted"
+                ).fetchone()[0]
+            if n > 0 and auto_state()["in_flight"]:
+                blocked = True
+                break
+            time.sleep(0.1)
+        check("在途写入被数据库锁挡住（未授予锁 + in_flight）", blocked)
+
+        # 4) 停止请求：不得等待被阻塞的写入，不得宣称已停止
+        t0 = time.monotonic()
+        r = post_auto({"enabled": False})
+        dt = time.monotonic() - t0
+        st = r.json()
+        check("停止请求不等待被阻塞的写入（快速返回）", dt < 2.0, f"{dt:.2f}s")
+        check("返回真实状态：停止中而非已停止",
+              r.ok and st["phase"] == "stopping" and st["month"] == month_a
+              and not st["running"] and st["pending_month"] is None,
+              r.text[:200])
+        st = auto_state()
+        check("状态接口同样显示停止中（未宣称已停止）",
+              st["phase"] == "stopping" and st["month"] == month_a, str(st))
+
+        # 5) 锁仍持有：请求切到乙月 → 只能登记待启动，不得启动乙月
+        t0 = time.monotonic()
+        r = post_auto({"enabled": True, "month": month_b, "interval_ms": 100})
+        dt = time.monotonic() - t0
+        st = r.json()
+        check("切月请求同样快速返回", dt < 2.0, f"{dt:.2f}s")
+        check("乙月登记为待启动，甲月仍是当前月",
+              r.ok and st["phase"] == "stopping" and st["month"] == month_a
+              and st["pending_month"] == month_b, r.text[:200])
+        cnt_b = month_row_count(month_b)
+        time.sleep(1.2)
+        check("锁未解除前乙月无写入（新月未启动）",
+              month_row_count(month_b) == cnt_b,
+              f"{cnt_b} → {month_row_count(month_b)}")
+        check("停止等待期间页面仍显示甲月为当前月",
+              auto_state()["month"] == month_a)
+
+        # 6) 停止等待中再次取消 → 撤销待启动月份
+        r = post_auto({"enabled": False})
+        st = r.json()
+        check("停止等待中再次取消：撤销待启动月份",
+              r.ok and st["phase"] == "stopping" and st["month"] == month_a
+              and st["pending_month"] is None, r.text[:200])
+        # 7) 重新登记切月，确认可再次排队
+        r = post_auto({"enabled": True, "month": month_b, "interval_ms": 100})
+        st = r.json()
+        check("可重新登记待启动乙月",
+              r.ok and st["pending_month"] == month_b, r.text[:200])
+    finally:
+        lock_conn.rollback()  # 8) 解锁：在途写入得以完成
+        lock_conn.close()
+
+    # 9) 解锁后：旧线程退出 → 待启动的乙月自动启动
+    try:
+        st = wait_auto("running", month_b, timeout=20)
+        check("解锁后旧线程退出、待启动乙月自动启动", True,
+              f"phase={st['phase']} month={st['month']}")
+    except RuntimeError as e:
+        check("解锁后旧线程退出、待启动乙月自动启动", False, str(e))
+        return
+    # 10) 乙月持续写入、甲月不再写（在途那笔已随解锁完成，之后不再有）
+    cnt_a, cnt_b = month_row_count(month_a), month_row_count(month_b)
+    time.sleep(1.5)
+    check("解锁后乙月持续写入", month_row_count(month_b) > cnt_b,
+          f"{cnt_b} → {month_row_count(month_b)}")
+    check("甲月已停止写入", month_row_count(month_a) == cnt_a,
+          f"{cnt_a} → {month_row_count(month_a)}")
+    # 11) 正常停止（无锁）：旧线程退出后进入 idle
+    post_auto({"enabled": False})
+    try:
+        wait_auto("idle", timeout=10)
+        check("无锁时停止后进入已停止(idle)", True)
+    except RuntimeError as e:
+        check("无锁时停止后进入已停止(idle)", False, str(e))
+
+
+def test_auto_writer_rapid_control(month_a: str, month_b: str):
+    """连续控制：快速启停/切月/取消，响应须立即且状态自洽，最终收敛到最后意图。"""
+    print(f"\n== 用例：自动采集连续控制（{month_a}/{month_b}）==", flush=True)
+    post_auto({"enabled": False})
+    try:
+        wait_auto("idle", timeout=10)
+    except RuntimeError:
+        pass
+    seq = [
+        {"enabled": True, "month": month_a, "interval_ms": 100},
+        {"enabled": True, "month": month_b, "interval_ms": 100},  # 切月
+        {"enabled": False},                                       # 取消/撤销待启动
+        {"enabled": True, "month": month_b, "interval_ms": 100},
+        {"enabled": True, "month": month_a, "interval_ms": 100},  # 再切回甲月
+        {"enabled": False},
+        {"enabled": True, "month": month_a, "interval_ms": 100},
+    ]
+    all_ok = True
+    for i, body in enumerate(seq):
+        t0 = time.monotonic()
+        r = post_auto(body)
+        dt = time.monotonic() - t0
+        ok = r.ok and dt < 2.0 and check_auto_coherent(r.json())
+        all_ok = all_ok and ok
+        if not ok:
+            check(f"连续控制第{i+1}步 {body}", False,
+                  f"rc={r.status_code} dt={dt:.2f}s body={r.text[:150]}")
+    check("连续控制每步都快速返回且状态自洽", all_ok)
+    # 最终收敛到最后意图：甲月运行中
+    try:
+        st = wait_auto("running", month_a, timeout=20)
+        check("连续控制后收敛到最后指定的月份运行", True,
+              f"month={st['month']}")
+    except RuntimeError as e:
+        check("连续控制后收敛到最后指定的月份运行", False, str(e))
+        return
+    # 最后停掉：进入 idle 后任何月份都不再有写入
+    post_auto({"enabled": False})
+    try:
+        wait_auto("idle", timeout=10)
+    except RuntimeError as e:
+        check("连续控制收尾停止进入 idle", False, str(e))
+        return
+    check("连续控制收尾停止进入 idle", True)
+    cnt_a, cnt_b = month_row_count(month_a), month_row_count(month_b)
+    time.sleep(1.0)
+    check("停止后甲乙两月都不再写入",
+          month_row_count(month_a) == cnt_a and month_row_count(month_b) == cnt_b)
+
+
 def test_happy_path(month: str):
     print(f"\n== 用例1：慢速复制 + 并发直接SQL增删改（{month}）==", flush=True)
     expected = snapshot(month)
@@ -324,6 +532,14 @@ def test_fail_and_retry(month: str, fail_at: str):
     # 重试（无故障注入）+ 并发写入
     r2 = api_migrate(month, sleep_ms=60)
     check("重试启动成功", r2.ok, r2.text[:200])
+    # 等重试真正接管：状态先从 failed 翻转为活跃阶段，
+    # 否则 wait_status 可能读到上一次故障注入残留的 failed
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        row = run_row(month)
+        if row and row[0] != "failed":
+            break
+        time.sleep(0.2)
     writer = ChaosWriter(month, expected)
     writer.start()
     status = wait_status(month, {"done", "failed"})
@@ -388,6 +604,8 @@ def main():
     check("种子数据至少 4 个月份", len(months) >= 4, f"months={months}")
     NEXT_MONTHS = months
     m1, m2, m3, m4 = months[:4]
+    # 自动采集用例使用未参与迁移的月份（种子有 6 个月）
+    m5, m6 = (months[4], months[5]) if len(months) >= 6 else (m3, m4)
 
     start_app()
     try:
@@ -397,6 +615,8 @@ def main():
         test_fail_and_retry(m2, "copying")
         test_fail_and_retry(m3, "finalizing")
         test_process_kill(m4)
+        test_auto_writer_blocked_stop_switch(m5, m6)
+        test_auto_writer_rapid_control(m5, m6)
     finally:
         crash_app()
 
